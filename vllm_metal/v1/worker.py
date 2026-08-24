@@ -295,6 +295,39 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.model
 
+    def liveness_probe(self) -> None:
+        """No-op RPC used by the API server liveness endpoint."""
+        return None
+
+    def update_weights_from_path(self, weight_path: str) -> None:
+        """Hot-swap model weights from a directory of safetensors shards.
+
+        Loads every ``*.safetensors`` file under ``weight_path`` and applies the
+        tensors to the live MLX model via ``load_weights``. Tensor names must
+        match the model's parameter paths (HF layout for mlx-lm models), and
+        tensors must be in the same format the model was loaded with (e.g. a
+        quantized model expects quantized tensors with their metadata).
+
+        Used by RL training loops to push fresh policy weights without a server
+        restart. Callers must reset the prefix cache afterwards so KV entries
+        computed under the previous weights are never reused.
+        """
+        import glob
+        import os
+
+        shard_paths = sorted(glob.glob(os.path.join(weight_path, "*.safetensors")))
+        if not shard_paths:
+            raise FileNotFoundError(f"No .safetensors files found under {weight_path}")
+
+        def _iter_shards():
+            for path in shard_paths:
+                yield from mx.load(path).items()
+
+        self.model_runner.model.load_weights(_iter_shards())
+        logger.info(
+            "Updated model weights from %s (%d shard(s))", weight_path, len(shard_paths)
+        )
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after engine auto-fits context to GPU memory."""
         self.model_config.max_model_len = max_model_len
