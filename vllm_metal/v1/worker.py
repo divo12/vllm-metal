@@ -295,6 +295,58 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.model
 
+    def liveness_probe(self) -> None:
+        """No-op RPC used by the API server liveness endpoint."""
+        return None
+
+    def update_weights_from_path(self, weight_path: str) -> None:
+        """Hot-swap model weights from a directory of safetensors shards.
+
+        Loads every ``*.safetensors`` file under ``weight_path`` and applies the
+        tensors to the live MLX model via ``load_weights``. Tensor names should
+        match the model's parameter paths (HF layout for mlx-lm models).
+
+        Loading is non-strict: tensors whose names do not appear in the model
+        (e.g. ``lm_head`` under tied embeddings, or wrappers that rename
+        modules) are skipped, and the match count is logged so silent no-op
+        swaps are detectable. Used by RL training loops to push fresh policy
+        weights without a server restart. Callers must reset the prefix cache
+        afterwards so KV entries computed under the previous weights are never
+        reused.
+        """
+        import glob
+        import os
+
+        from mlx.utils import tree_flatten
+
+        shard_paths = sorted(glob.glob(os.path.join(weight_path, "*.safetensors")))
+        if not shard_paths:
+            raise FileNotFoundError(f"No .safetensors files found under {weight_path}")
+
+        incoming: dict[str, Any] = {}
+        for path in shard_paths:
+            incoming.update(mx.load(path).items())
+
+        model = self.model_runner.model
+        model_keys = {k for k, _ in tree_flatten(model.parameters())}
+        matched = {k: v for k, v in incoming.items() if k in model_keys}
+        if not matched:
+            sample = ", ".join(sorted(model_keys)[:8])
+            raise ValueError(
+                f"None of the {len(incoming)} checkpoint tensors match the "
+                f"model's parameter tree — refusing to hot-swap. Model keys "
+                f"(sample of {len(model_keys)}): {sample}"
+            )
+        logger.info(
+            "Weight update: matched %d/%d checkpoint tensors (%d in model)",
+            len(matched),
+            len(incoming),
+            len(model_keys),
+        )
+        model.load_weights(matched.items(), strict=False)
+        logger.info("Updated model weights from %s", weight_path)
+
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after engine auto-fits context to GPU memory."""
         self.model_config.max_model_len = max_model_len
